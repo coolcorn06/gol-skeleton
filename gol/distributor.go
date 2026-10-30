@@ -42,7 +42,7 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-	for turn = 0; turn < p.Turns; turn++ {
+	/*for turn = 0; turn < p.Turns; turn++ {
 		for y := 0; y < p.ImageHeight; y++ {
 			for x := 0; x < p.ImageWidth; x++ {
 				var currentCell util.Cell
@@ -52,6 +52,35 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}
 		gameMap, newGameMap = newGameMap, gameMap
+	}*/
+	channels := make([]chan [][]uint8, p.Threads)
+	WorkerRow := p.ImageHeight / p.Threads
+	for turn = 0; turn < p.Turns; turn++{
+		for i := 0; i < p.Threads; i++ {
+			startY := i * WorkerRow
+			endY := (i+1) * WorkerRow
+			if i == p.Threads -1 {
+				endY = p.ImageHeight
+			}
+			channels[i] = make(chan [][]uint8)
+			go worker(p, startY, endY, gameMap, channels[i])
+			/*for y := startY; y < endY; y++{
+				for x:= 0; x < p.ImageWidth; x++{
+					var currentCell util.Cell
+					currentCell.X = x
+					currentCell.Y = y
+					newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
+				}
+			}*/
+			
+		}
+		var newworld [][]uint8
+		for i := 0; i < p.Threads; i++{
+			newworld = append(newworld, <-channels[i]...)
+		}
+		gameMap = newworld
+
+		//gameMap, newGameMap = newGameMap, gameMap
 	}
 	// TODO: Execute all turns of the Game of Life.
 
@@ -230,5 +259,15 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 }
 
 func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
-
+	newGameCell := make([][]uint8, endY-startY)
+	for y := startY; y < endY; y++{
+		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
+		for x:= 0; x < p.ImageWidth; x++{
+			var currentCell util.Cell
+			currentCell.X = x				
+			currentCell.Y = y
+			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
+		}		
+	}
+	calc <- newGameCell
 }
