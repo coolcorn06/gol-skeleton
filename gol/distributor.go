@@ -2,6 +2,8 @@ package gol
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
@@ -30,7 +32,7 @@ func distributor(p Params, c distributorChannels) {
 	var alive []util.Cell
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
-			v := <-c.ioInput
+			v := <-c.ioInput //waits for the next byte from IO and stores it in v
 			gameMap[y][x] = v
 			newGameMap[y][x] = v
 		}
@@ -42,21 +44,98 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-	for turn < p.Turns {
+
+	/*for turn = 0; turn < p.Turns; turn++ {
 		for y := 0; y < p.ImageHeight; y++ {
 			for x := 0; x < p.ImageWidth; x++ {
 				var currentCell util.Cell
-				currentCell.X = x
 				currentCell.Y = y
+				currentCell.X = x
 				newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
 			}
 		}
+		gameMap, newGameMap = newGameMap, gameMap
+	}*/
+	// Shared snapshot for the ticker: latest finished world and its turn number.
+	// Like the mutex-protected shared variables in the concurrency labs.
+	var mu sync.Mutex
+	snapshot := gameMap
+	completedTurns := 0
+
+	// Ticker goroutine: every 2 seconds count alive cells in the snapshot
+	// and report them, same select pattern as the quiz lab timer.
+	done := make(chan struct{})
+	tickerStopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		defer close(tickerStopped)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				world := snapshot
+				t := completedTurns
+				mu.Unlock()
+				count := 0
+				for y := range world {
+					for x := range world[y] {
+						if world[y][x] == 255 {
+							count++
+						}
+					}
+				}
+				c.events <- AliveCellsCount{CompletedTurns: t, CellsCount: count}
+			}
+		}
+	}()
+
+	channels := make([]chan [][]uint8, p.Threads)
+	WorkerRow := p.ImageHeight / p.Threads
+	for turn = 0; turn < p.Turns; turn++ {
+		for i := 0; i < p.Threads; i++ {
+			startY := i * WorkerRow
+			endY := (i + 1) * WorkerRow
+			if i == p.Threads-1 {
+				endY = p.ImageHeight
+			}
+			channels[i] = make(chan [][]uint8)
+			go worker(p, startY, endY, gameMap, channels[i])
+			/*for y := startY; y < endY; y++{
+				for x:= 0; x < p.ImageWidth; x++{
+					var currentCell util.Cell
+					currentCell.X = x
+					currentCell.Y = y
+					newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
+				}
+			}*/
+
+		}
+		var newworld [][]uint8
+		for i := 0; i < p.Threads; i++ {
+			newworld = append(newworld, <-channels[i]...)
+		}
+		gameMap = newworld
+
+		// Publish the finished world for the ticker and report the completed turn.
+		mu.Lock()
+		snapshot = gameMap
+		completedTurns = turn + 1
+		mu.Unlock()
+		c.events <- TurnComplete{CompletedTurns: turn + 1}
+
+		//gameMap, newGameMap = newGameMap, gameMap
 	}
+	// Stop the ticker before closing events.
+	close(done)
+	<-tickerStopped
 	// TODO: Execute all turns of the Game of Life.
 
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
-			if newGameMap[y][x] != 0 {
+			if gameMap[y][x] != 0 {
 				var alive1 util.Cell
 				alive1.X = x
 				alive1.Y = y
@@ -93,48 +172,130 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 	if cell.Y == p.ImageHeight-1 {
 		hasDown = false
 	}
+
 	if hasLeft && hasUp {
-		if currentMap[cell.X-1][cell.Y-1] != 0 {
+		if currentMap[cell.Y-1][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if hasUp {
-		if currentMap[cell.X][cell.Y-1] != 0 {
+		if currentMap[cell.Y-1][cell.X] != 0 {
 			count++
 		}
 	}
 	if hasUp && hasRight {
-		if currentMap[cell.X+1][cell.Y-1] != 0 {
+		if currentMap[cell.Y-1][cell.X+1] != 0 {
 			count++
 		}
 	}
 	if hasLeft {
-		if currentMap[cell.X-1][cell.Y] != 0 {
+		if currentMap[cell.Y][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if hasRight {
-		if currentMap[cell.X+1][cell.Y] != 0 {
+		if currentMap[cell.Y][cell.X+1] != 0 {
 			count++
 		}
 	}
 	if hasLeft && hasDown {
-		if currentMap[cell.X-1][cell.Y+1] != 0 {
+		if currentMap[cell.Y+1][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if hasDown {
-		if currentMap[cell.X][cell.Y+1] != 0 {
+		if currentMap[cell.Y+1][cell.X] != 0 {
 			count++
 		}
 	}
 	if hasRight && hasDown {
-		if currentMap[cell.X+1][cell.Y+1] != 0 {
+		if currentMap[cell.Y+1][cell.X+1] != 0 {
 			count++
 		}
-	} //count the number of surrounding live cells
+	}
+	if !hasLeft {
+		if currentMap[cell.Y][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasUp {
+		if currentMap[p.ImageHeight-1][cell.X] != 0 {
+			count++
+		}
+	}
+	if !hasRight {
+		if currentMap[cell.Y][0] != 0 {
+			count++
+		}
+	}
+	if !hasDown {
+		if currentMap[0][cell.X] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && !hasUp {
+		if currentMap[p.ImageHeight-1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && !hasDown {
+		if currentMap[0][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasRight && !hasUp {
+		if currentMap[p.ImageHeight-1][0] != 0 {
+			count++
+		}
+	}
+	if !hasRight && !hasDown {
+		if currentMap[0][0] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && hasUp {
+		if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && hasDown {
+		if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasRight && hasUp {
+		if currentMap[cell.Y-1][0] != 0 {
+			count++
+		}
+	}
+	if !hasRight && hasDown {
+		if currentMap[cell.Y+1][0] != 0 {
+			count++
+		}
+	}
+	if !hasUp && hasLeft {
+		if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if !hasUp && hasRight {
+		if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
+			count++
+		}
+	}
+	if !hasDown && hasLeft {
+		if currentMap[0][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if !hasDown && hasRight {
+		if currentMap[0][cell.X+1] != 0 {
+			count++
+		}
+	}
+	//count the number of surrounding live cells
 
-	if currentMap[cell.X][cell.Y] != 0 {
+	if currentMap[cell.Y][cell.X] != 0 {
 		if count == 2 || count == 3 {
 			return 255
 		}
@@ -144,4 +305,18 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 		return 255
 	}
 	return 0 //final decision of current cell, with "else" omitted
+}
+
+func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
+	newGameCell := make([][]uint8, endY-startY)
+	for y := startY; y < endY; y++ {
+		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
+		for x := 0; x < p.ImageWidth; x++ {
+			var currentCell util.Cell
+			currentCell.X = x
+			currentCell.Y = y
+			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
+		}
+	}
+	calc <- newGameCell
 }
