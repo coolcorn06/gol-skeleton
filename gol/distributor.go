@@ -2,6 +2,8 @@ package gol
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
@@ -13,17 +15,14 @@ type distributorChannels struct {
 	ioFilename chan<- string
 	ioOutput   chan<- uint8
 	ioInput    <-chan uint8
-
-	//keyPresses <-chan uint8 // Newly added channel for key press
+	keyPresses <-chan rune // Newly added channel for key press
 }
 
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels) {
 	gameMap := make([][]uint8, p.ImageHeight)
-	newGameMap := make([][]uint8, p.ImageHeight) // Prepare to make paragraph for next phase
 	for i := range gameMap {
 		gameMap[i] = make([]uint8, p.ImageWidth)
-		newGameMap[i] = make([]uint8, p.ImageWidth)
 	}
 	c.ioCommand <- ioInput                                            // Set current mode as input
 	c.ioFilename <- fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight) // Read the image
@@ -32,7 +31,6 @@ func distributor(p Params, c distributorChannels) {
 		for x := 0; x < p.ImageWidth; x++ {
 			v := <-c.ioInput //waits for the next byte from IO and stores it in v
 			gameMap[y][x] = v
-			newGameMap[y][x] = v
 		}
 	}
 	// Generate initial map
@@ -40,48 +38,95 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-	/*for turn = 0; turn < p.Turns; turn++ {
-		for y := 0; y < p.ImageHeight; y++ {
-			for x := 0; x < p.ImageWidth; x++ {
-				var currentCell util.Cell
-				currentCell.Y = y
-				currentCell.X = x
-				newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
+	c.events <- StateChange{turn, Executing}
+	// Shared snapshot for the ticker: latest finished world and its turn number.
+	// Like the mutex-protected shared variables in the concurrency labs.
+	var mu sync.Mutex
+	snapshot := gameMap
+	completedTurns := 0
+
+	// Ticker goroutine: every 2 seconds count alive cells in the snapshot
+	// and report them, same select pattern as the quiz lab timer.
+	done := make(chan struct{})
+	tickerStopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		defer close(tickerStopped)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				world := snapshot
+				t := completedTurns
+				mu.Unlock()
+				count := 0
+				for y := range world {
+					for x := range world[y] {
+						if world[y][x] == 255 {
+							count++
+						}
+					}
+				}
+				c.events <- AliveCellsCount{CompletedTurns: t, CellsCount: count}
 			}
 		}
-		gameMap, newGameMap = newGameMap, gameMap
-	}*/
+	}()
+
+	var paused, quitRequested bool
+	paused = false
+	quitRequested = false
+
 	channels := make([]chan [][]uint8, p.Threads)
 	WorkerRow := p.ImageHeight / p.Threads
-	for turn = 0; turn < p.Turns; turn++{
+	for turn < p.Turns && !quitRequested { // Be aware, the condition is modified
+		// When pausing, "s" and "q" can still work normally
+		if paused {
+			key := <-c.keyPresses
+			handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+			continue
+		}
+
+		// When not pausing, check if there is keyPresses required to process
+		select {
+		case key := <-c.keyPresses:
+			handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+			continue
+		default:
+		}
 		for i := 0; i < p.Threads; i++ {
 			startY := i * WorkerRow
-			endY := (i+1) * WorkerRow
-			if i == p.Threads -1 {
+			endY := (i + 1) * WorkerRow
+			if i == p.Threads-1 {
 				endY = p.ImageHeight
 			}
 			channels[i] = make(chan [][]uint8)
 			go worker(p, startY, endY, gameMap, channels[i])
-			/*for y := startY; y < endY; y++{
-				for x:= 0; x < p.ImageWidth; x++{
-					var currentCell util.Cell
-					currentCell.X = x
-					currentCell.Y = y
-					newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
-				}
-			}*/
-			
-		}
+
+		} // execute current turn
 		var newworld [][]uint8
-		for i := 0; i < p.Threads; i++{
+		for i := 0; i < p.Threads; i++ {
 			newworld = append(newworld, <-channels[i]...)
 		}
 		gameMap = newworld
+		turn++ //Respond to modification of condition of for loop
+
+		// Publish the finished world for the ticker and report the completed turn.
+		mu.Lock()
+		snapshot = gameMap
+		completedTurns = turn + 1
+		mu.Unlock()
+		c.events <- CellsFlipped{CompletedTurns: turn, Cells: alive}
+		c.events <- TurnComplete{CompletedTurns: turn + 1}
 
 		//gameMap, newGameMap = newGameMap, gameMap
 	}
+	// Stop the ticker before closing events.
+	close(done)
+	<-tickerStopped
 	// TODO: Execute all turns of the Game of Life.
 
 	for y := 0; y < p.ImageHeight; y++ {
@@ -95,6 +140,7 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: alive}
+	makePGM(p, c, gameMap, turn)
 	// TODO: Report the final state using FinalTurnCompleteEvent.
 
 	// Make sure that the Io has finished any output before exiting.
@@ -205,42 +251,42 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 		}
 	}
 	if !hasLeft && hasUp {
-    	if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
+		if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
 			count++
 		}
 	}
 	if !hasLeft && hasDown {
-    	if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
+		if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
 			count++
 		}
 	}
 	if !hasRight && hasUp {
-    	if currentMap[cell.Y-1][0] != 0 {
+		if currentMap[cell.Y-1][0] != 0 {
 			count++
 		}
 	}
 	if !hasRight && hasDown {
-    	if currentMap[cell.Y+1][0] != 0 {
+		if currentMap[cell.Y+1][0] != 0 {
 			count++
 		}
 	}
 	if !hasUp && hasLeft {
-    	if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
+		if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if !hasUp && hasRight {
-    	if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
+		if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
 			count++
 		}
 	}
 	if !hasDown && hasLeft {
-    	if currentMap[0][cell.X-1] != 0 {
+		if currentMap[0][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if !hasDown && hasRight {
-	    if currentMap[0][cell.X+1] != 0 {
+		if currentMap[0][cell.X+1] != 0 {
 			count++
 		}
 	}
@@ -260,14 +306,46 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 
 func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
 	newGameCell := make([][]uint8, endY-startY)
-	for y := startY; y < endY; y++{
+	for y := startY; y < endY; y++ {
 		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
-		for x:= 0; x < p.ImageWidth; x++{
+		for x := 0; x < p.ImageWidth; x++ {
 			var currentCell util.Cell
-			currentCell.X = x				
+			currentCell.X = x
 			currentCell.Y = y
 			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
-		}		
+		}
 	}
 	calc <- newGameCell
+}
+
+func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
+	filename := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
+
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for y := 0; y < p.ImageHeight; y++ {
+		for x := 0; x < p.ImageWidth; x++ {
+			c.ioOutput <- gameMap[y][x]
+		}
+	}
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: filename}
+}
+
+func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int) {
+	switch key {
+	case 's':
+		makePGM(p, c, gameMap, turn)
+	case 'p':
+		*paused = !*paused
+		if *paused {
+			c.events <- StateChange{turn, Paused}
+		} else {
+			c.events <- StateChange{turn, Executing}
+		}
+	case 'q':
+		*quit = true
+	}
 }
