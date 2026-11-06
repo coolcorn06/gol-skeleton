@@ -38,8 +38,17 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-	c.events <- StateChange{turn, Executing}
+	var initialalives []util.Cell
+	for y := 0; y < p.ImageHeight; y++{
+		for x := 0; x < p.ImageWidth; x++{
+			if gameMap[y][x] != 0{
+				initialalives = append(initialalives, util.Cell{Y: y, X: x})
+			}
+		}
+	}
+
+	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialalives}
+	c.events <- StateChange{0, Executing}
 	// Shared snapshot for the ticker: latest finished world and its turn number.
 	// Like the mutex-protected shared variables in the concurrency labs.
 	var mu sync.Mutex
@@ -57,14 +66,14 @@ func distributor(p Params, c distributorChannels) {
 		for {
 			select {
 			case <-done:
-				return
+				return //trigers the defers
 			case <-ticker.C:
 				mu.Lock()
 				world := snapshot
 				t := completedTurns
 				mu.Unlock()
 				count := 0
-				for y := range world {
+				for y := range world {//counting alive cells
 					for x := range world[y] {
 						if world[y][x] == 255 {
 							count++
@@ -76,15 +85,21 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}()
 
+
+
+	
 	var paused, quitRequested bool
 	paused = false
 	quitRequested = false
+	
 
 	channels := make([]chan [][]uint8, p.Threads)
 	WorkerRow := p.ImageHeight / p.Threads
 	for turn < p.Turns && !quitRequested { // Be aware, the condition is modified
 		// When pausing, "s" and "q" can still work normally
+		var changedcells []util.Cell
 		if paused {
+			//c.events <- StateChange{turn+1, Paused}
 			key := <-c.keyPresses
 			handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
 			continue
@@ -111,17 +126,31 @@ func distributor(p Params, c distributorChannels) {
 		for i := 0; i < p.Threads; i++ {
 			newworld = append(newworld, <-channels[i]...)
 		}
+		for y := 0; y < p.ImageHeight; y++{
+			for x := 0; x < p.ImageWidth; x++{
+				if gameMap[y][x] != newworld[y][x]{
+					var changedcell util.Cell
+					changedcell.X = x
+					changedcell.Y = y
+					changedcells = append(changedcells, changedcell)
+					
+				}
+			}
+		}
+		c.events <- CellsFlipped{CompletedTurns:  turn+1, Cells: changedcells}
 		gameMap = newworld
-		turn++ //Respond to modification of condition of for loop
+		 //Respond to modification of condition of for loop
 
 		// Publish the finished world for the ticker and report the completed turn.
 		mu.Lock()
 		snapshot = gameMap
-		completedTurns = turn + 1
+		completedTurns = turn+1
 		mu.Unlock()
-		c.events <- CellsFlipped{CompletedTurns: turn, Cells: alive}
-		c.events <- TurnComplete{CompletedTurns: turn + 1}
 
+		//c.events <- CellsFlipped{CompletedTurns: turn, Cells: alive}
+		c.events <- TurnComplete{CompletedTurns: turn+1}
+
+		turn++
 		//gameMap, newGameMap = newGameMap, gameMap
 	}
 	// Stop the ticker before closing events.
