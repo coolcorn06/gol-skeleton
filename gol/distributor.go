@@ -38,7 +38,7 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	var initialalives []util.Cell
+	var initialalives []util.Cell //initial alive cells detected.
 	for y := 0; y < p.ImageHeight; y++{
 		for x := 0; x < p.ImageWidth; x++{
 			if gameMap[y][x] != 0{
@@ -47,7 +47,7 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 
-	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialalives}
+	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialalives}//turn -> 0
 	c.events <- StateChange{0, Executing}
 	// Shared snapshot for the ticker: latest finished world and its turn number.
 	// Like the mutex-protected shared variables in the concurrency labs.
@@ -126,7 +126,7 @@ func distributor(p Params, c distributorChannels) {
 		for i := 0; i < p.Threads; i++ {
 			newworld = append(newworld, <-channels[i]...)
 		}
-		for y := 0; y < p.ImageHeight; y++{
+		for y := 0; y < p.ImageHeight; y++{//comparison between the old game map and new game map
 			for x := 0; x < p.ImageWidth; x++{
 				if gameMap[y][x] != newworld[y][x]{
 					var changedcell util.Cell
@@ -137,7 +137,7 @@ func distributor(p Params, c distributorChannels) {
 				}
 			}
 		}
-		c.events <- CellsFlipped{CompletedTurns:  turn+1, Cells: changedcells}
+		c.events <- CellsFlipped{CompletedTurns:  turn+1, Cells: changedcells} //all changed cells are sent
 		gameMap = newworld
 		 //Respond to modification of condition of for loop
 
