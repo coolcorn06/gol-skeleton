@@ -3,6 +3,7 @@ package gol
 import (
 	"fmt"
 	"log"
+	"net/rpc"
 	"sync"
 	"time"
 
@@ -59,7 +60,6 @@ func distributor(p Params, c distributorChannels) {
 	}*/
 	// Shared snapshot for the ticker: latest finished world and its turn number.
 	// Like the mutex-protected shared variables in the concurrency labs.
-
 	var mu sync.Mutex
 	snapshot := gameMap
 	completedTurns := 0
@@ -97,36 +97,58 @@ func distributor(p Params, c distributorChannels) {
 	// Distributed step 1: if an engine address is configured, the whole evolution
 	// is delegated to a remote machine through one blocking RPC call.
 	if addr := EngineAddress(); addr != "" {
-		world, completed, err := evolveRemotely(addr, p, gameMap)
+		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
-			log.Printf("[Controller] engine at %v failed: %v", addr, err)
+			log.Printf("[Controller] engine at %v failed to dial: %v", addr, err)
 			close(done)
 			<-tickerStopped
 			c.events <- StateChange{0, Quitting}
 			close(c.events)
 			return
 		}
-		gameMap = world
-		turn = completed
+		defer func() {
+			if err := client.Close(); err != nil {
+				log.Printf("[Controller] failed to close client: %v", err)
+			}
+		}()
 
-		mu.Lock()
-		snapshot = gameMap
-		completedTurns = turn
-		mu.Unlock()
-		c.events <- TurnComplete{CompletedTurns: turn}
-	} else {
-		// local loop to compute all turns
-		for turn = 0; turn < p.Turns; turn++ {
-			gameMap = nextWorld(p, gameMap)
+		batchSize := 100
 
-			// Publish the finished world for the ticker and report the completed turn.
+		for turn < p.Turns {
+			toCompute := batchSize
+			if p.Turns-turn < batchSize {
+				toCompute = p.Turns - turn
+			}
+
+			request := EvolveRequest{
+				World:       gameMap,
+				Turns:       toCompute,
+				Threads:     p.Threads,
+				ImageWidth:  p.ImageWidth,
+				ImageHeight: p.ImageHeight,
+			}
+			var response EvolveResponse
+
+			err := client.Call("GolEngine.Evolve", request, &response)
+			if err != nil {
+				log.Printf("[Controller] engine call failed: %v", err)
+				break
+			}
+
+			gameMap = response.World
+			turn += response.CompletedTurns
+
 			mu.Lock()
 			snapshot = gameMap
-			completedTurns = turn + 1
+			completedTurns = turn
 			mu.Unlock()
-			c.events <- TurnComplete{CompletedTurns: turn + 1}
+
+			c.events <- TurnComplete{CompletedTurns: turn}
 		}
+	} else {
+
 	}
+
 	// Stop the ticker before closing events.
 	close(done)
 	<-tickerStopped
