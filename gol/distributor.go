@@ -2,6 +2,9 @@ package gol
 
 import (
 	"fmt"
+	"log"
+	"sync"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
@@ -42,6 +45,7 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
+
 	/*for turn = 0; turn < p.Turns; turn++ {
 		for y := 0; y < p.ImageHeight; y++ {
 			for x := 0; x < p.ImageWidth; x++ {
@@ -53,36 +57,79 @@ func distributor(p Params, c distributorChannels) {
 		}
 		gameMap, newGameMap = newGameMap, gameMap
 	}*/
-	channels := make([]chan [][]uint8, p.Threads)
-	WorkerRow := p.ImageHeight / p.Threads
-	for turn = 0; turn < p.Turns; turn++{
-		for i := 0; i < p.Threads; i++ {
-			startY := i * WorkerRow
-			endY := (i+1) * WorkerRow
-			if i == p.Threads -1 {
-				endY = p.ImageHeight
-			}
-			channels[i] = make(chan [][]uint8)
-			go worker(p, startY, endY, gameMap, channels[i])
-			/*for y := startY; y < endY; y++{
-				for x:= 0; x < p.ImageWidth; x++{
-					var currentCell util.Cell
-					currentCell.X = x
-					currentCell.Y = y
-					newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
-				}
-			}*/
-			
-		}
-		var newworld [][]uint8
-		for i := 0; i < p.Threads; i++{
-			newworld = append(newworld, <-channels[i]...)
-		}
-		gameMap = newworld
+	// Shared snapshot for the ticker: latest finished world and its turn number.
+	// Like the mutex-protected shared variables in the concurrency labs.
 
-		//gameMap, newGameMap = newGameMap, gameMap
+	var mu sync.Mutex
+	snapshot := gameMap
+	completedTurns := 0
+
+	// Ticker goroutine: every 2 seconds count alive cells in the snapshot
+	// and report them, same select pattern as the quiz lab timer.
+	done := make(chan struct{})
+	tickerStopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		defer close(tickerStopped)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				world := snapshot
+				t := completedTurns
+				mu.Unlock()
+				count := 0
+				for y := range world {
+					for x := range world[y] {
+						if world[y][x] == 255 {
+							count++
+						}
+					}
+				}
+				c.events <- AliveCellsCount{CompletedTurns: t, CellsCount: count}
+			}
+		}
+	}()
+
+	// Distributed step 1: if an engine address is configured, the whole evolution
+	// is delegated to a remote machine through one blocking RPC call.
+	if addr := EngineAddress(); addr != "" {
+		world, completed, err := evolveRemotely(addr, p, gameMap)
+		if err != nil {
+			log.Printf("[Controller] engine at %v failed: %v", addr, err)
+			close(done)
+			<-tickerStopped
+			c.events <- StateChange{0, Quitting}
+			close(c.events)
+			return
+		}
+		gameMap = world
+		turn = completed
+
+		mu.Lock()
+		snapshot = gameMap
+		completedTurns = turn
+		mu.Unlock()
+		c.events <- TurnComplete{CompletedTurns: turn}
+	} else {
+		// local loop to compute all turns
+		for turn = 0; turn < p.Turns; turn++ {
+			gameMap = nextWorld(p, gameMap)
+
+			// Publish the finished world for the ticker and report the completed turn.
+			mu.Lock()
+			snapshot = gameMap
+			completedTurns = turn + 1
+			mu.Unlock()
+			c.events <- TurnComplete{CompletedTurns: turn + 1}
+		}
 	}
-	// TODO: Execute all turns of the Game of Life.
+	// Stop the ticker before closing events.
+	close(done)
+	<-tickerStopped
 
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
@@ -205,42 +252,42 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 		}
 	}
 	if !hasLeft && hasUp {
-    	if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
+		if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
 			count++
 		}
 	}
 	if !hasLeft && hasDown {
-    	if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
+		if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
 			count++
 		}
 	}
 	if !hasRight && hasUp {
-    	if currentMap[cell.Y-1][0] != 0 {
+		if currentMap[cell.Y-1][0] != 0 {
 			count++
 		}
 	}
 	if !hasRight && hasDown {
-    	if currentMap[cell.Y+1][0] != 0 {
+		if currentMap[cell.Y+1][0] != 0 {
 			count++
 		}
 	}
 	if !hasUp && hasLeft {
-    	if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
+		if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if !hasUp && hasRight {
-    	if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
+		if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
 			count++
 		}
 	}
 	if !hasDown && hasLeft {
-    	if currentMap[0][cell.X-1] != 0 {
+		if currentMap[0][cell.X-1] != 0 {
 			count++
 		}
 	}
 	if !hasDown && hasRight {
-	    if currentMap[0][cell.X+1] != 0 {
+		if currentMap[0][cell.X+1] != 0 {
 			count++
 		}
 	}
@@ -258,16 +305,38 @@ func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Dec
 	return 0 //final decision of current cell, with "else" omitted
 }
 
+// nextWorld evolves one turn, splitting the board into p.Threads horizontal bands
+// (the same divide-and-conquer pattern used in the concurrency lab's image filter).
+func nextWorld(p Params, current [][]uint8) [][]uint8 {
+	WorkerRow := p.ImageHeight / p.Threads
+	channels := make([]chan [][]uint8, p.Threads)
+	for i := 0; i < p.Threads; i++ {
+		startY := i * WorkerRow
+		endY := (i + 1) * WorkerRow
+		if i == p.Threads-1 {
+			endY = p.ImageHeight // the last worker also takes the remainder
+		}
+		channels[i] = make(chan [][]uint8)
+		go worker(p, startY, endY, current, channels[i])
+	}
+
+	var next [][]uint8
+	for i := 0; i < p.Threads; i++ {
+		next = append(next, <-channels[i]...)
+	}
+	return next
+}
+
 func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
 	newGameCell := make([][]uint8, endY-startY)
-	for y := startY; y < endY; y++{
+	for y := startY; y < endY; y++ {
 		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
-		for x:= 0; x < p.ImageWidth; x++{
+		for x := 0; x < p.ImageWidth; x++ {
 			var currentCell util.Cell
-			currentCell.X = x				
+			currentCell.X = x
 			currentCell.Y = y
 			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
-		}		
+		}
 	}
 	calc <- newGameCell
 }
