@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"sync"
 )
 
 // EvolveRequest is what the local controller sends to the remote engine:
@@ -26,6 +27,28 @@ type EvolveResponse struct {
 // GolEngine is the RPC service that evolves Game of Life on a remote machine.
 type GolEngine struct{}
 
+type EngineState struct {
+	mu         sync.Mutex
+	aliveCount int
+	turn       int
+}
+
+var engineState = &EngineState{}
+
+type AliveRequest struct{}
+type AliveResponse struct {
+	AliveCount int
+	Turn       int
+}
+
+func (e *GolEngine) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
+	engineState.mu.Lock()
+	resp.AliveCount = engineState.aliveCount
+	resp.Turn = engineState.turn
+	engineState.mu.Unlock()
+	return nil
+}
+
 // Evolve processes every requested turn in a single blocking call (distributed step 1).
 func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 	p := Params{
@@ -41,6 +64,19 @@ func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 	world := req.World
 	for turn := 0; turn < p.Turns; turn++ {
 		world = nextWorld(p, world)
+
+		n := 0
+		for y := range world {
+			for x := range world[y] {
+				if world[y][x] != 0 {
+					n++
+				}
+			}
+		}
+		engineState.mu.Lock()
+		engineState.aliveCount = n
+		engineState.turn = turn + 1
+		engineState.mu.Unlock()
 	}
 
 	resp.World = world
