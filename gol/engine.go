@@ -6,6 +6,8 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
+	//"time"
 )
 
 // EvolveRequest is what the local controller sends to the remote engine:
@@ -49,7 +51,16 @@ func (e *GolEngine) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
 	return nil
 }
 
+func (e *GolEngine) CleanUp(req AliveRequest, resp *AliveResponse) error{
+	go func (){
+		time.Sleep(2 *time.Microsecond)
+		os.Exit(0)
+	}()
+	return nil
+}
+
 // Evolve processes every requested turn in a single blocking call (distributed step 1).
+//calculates all cells for all turns and returns final world and the num of turns.
 func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 	p := Params{
 		Turns:       req.Turns,
@@ -86,10 +97,10 @@ func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 
 // StartEngine registers the engine and serves RPC requests until the process exits.
 func StartEngine(addr string) error {
-	if err := rpc.Register(new(GolEngine)); err != nil {
+	if err := rpc.Register(new(GolEngine)); err != nil {//makes the engine
 		return err
 	}
-	listener, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp", addr)//opens network port. addr=port num
 	if err != nil {
 		return err
 	}

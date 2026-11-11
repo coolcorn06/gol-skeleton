@@ -86,8 +86,8 @@ func distributor(p Params, c distributorChannels) {
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
-				if tickerClient != nil {
+			case <-ticker.C://step 2: reporting arrive cells to the remote.
+				if tickerClient != nil {//if client exist
 					var resp AliveResponse
 					if err := tickerClient.Call("GolEngine.GetAliveCount", AliveRequest{}, &resp); err == nil {
 						c.events <- AliveCellsCount{CompletedTurns: resp.Turn, CellsCount: resp.AliveCount}
@@ -117,9 +117,9 @@ func distributor(p Params, c distributorChannels) {
 	quitRequested = false
 	// Distributed step 1: if an engine address is configured, the whole evolution
 	// is delegated to a remote machine through one blocking RPC call.
-	if addr := EngineAddress(); addr != "" {
-		client, err := rpc.Dial("tcp", addr)
-		if err != nil {
+	if addr := EngineAddress(); addr != "" {//if addr finds a port.
+		client, err := rpc.Dial("tcp", addr)//connects to the engine.
+		if err != nil {//if fail to connect.
 			log.Printf("[Controller] engine at %v failed to dial: %v", addr, err)
 			close(done)
 			<-tickerStopped
@@ -128,7 +128,7 @@ func distributor(p Params, c distributorChannels) {
 			return
 		}
 		defer func() {
-			if err := client.Close(); err != nil {
+			if err := client.Close(); err != nil {//closes the connection.
 				log.Printf("[Controller] failed to close client: %v", err)
 			}
 		}()
@@ -141,17 +141,17 @@ func distributor(p Params, c distributorChannels) {
 			err   error
 		}
 
-		for turn < p.Turns && !quitRequested {
+		for turn < p.Turns && !quitRequested {//main loop
 			if paused {
 				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, client)
 				continue
 			}
 
 			// send 1 batch to engine, waiting for results async
 			toCompute := batchSize
 			if p.Turns-turn < toCompute {
-				toCompute = p.Turns - turn
+				toCompute = p.Turns - turn//how many turns left
 			}
 			req := EvolveRequest{World: gameMap, Turns: toCompute, Threads: p.Threads,
 				ImageWidth: p.ImageWidth, ImageHeight: p.ImageHeight}
@@ -167,13 +167,13 @@ func distributor(p Params, c distributorChannels) {
 			for {
 				select {
 				case key := <-c.keyPresses:
-					handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+					handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, client)
 					if quitRequested {
 						break waiting
 					} // no longer waiting for this batch
 				case res := <-resultCh:
 					if res.err != nil {
-						log.Printf("[Controller} Engine call failed: %v", res.err)
+						log.Printf("[Controller] Engine call failed: %v", res.err)
 						break waiting
 					}
 					gameMap = res.world
@@ -206,12 +206,12 @@ func distributor(p Params, c distributorChannels) {
 		for turn < p.Turns && !quitRequested {
 			if paused {
 				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, nil)
 				continue
 			}
 			select {
 			case key := <-c.keyPresses:
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, nil)
 				continue
 			default:
 			}
@@ -256,20 +256,22 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: alive}
-	makePGM(p, c, gameMap, turn)
 	// TODO: Report the final state using FinalTurnCompleteEvent.
-
-	makePGM(p, c, gameMap, turn)
+	if !quitRequested {
+		makePGM(p, c, gameMap, turn)
+	}
+	
 
 	// Make sure that the Io has finished any output before exiting.
-	c.ioCommand <- ioCheckIdle
-	<-c.ioIdle
+	//c.ioCommand <- ioCheckIdle
+	//<-c.ioIdle
 
 	c.events <- StateChange{turn, Quitting}
 
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	close(c.events)
 }
+
 func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 {
 	count := countNeighbours(currentMap, cell, p)
 
@@ -352,12 +354,12 @@ func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
 	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: filename}
 }
 
-func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int) {
+func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int, client *rpc.Client) {
 	switch key {
 	case 's':
 		makePGM(p, c, gameMap, turn)
 	case 'p':
-		*paused = !*paused
+		*paused = !*paused//flips
 		if *paused {
 			c.events <- StateChange{turn, Paused}
 		} else {
@@ -365,5 +367,14 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 		}
 	case 'q':
 		*quit = true
+	case 'k':
+		makePGM(p, c, gameMap, turn)
+		if client != nil{//client exists
+			var resp AliveResponse
+			err := client.Call("GolEngine.CleanUp", AliveRequest{}, &resp)
+			if err != nil {log.Printf("[Controller] Engine call failed: %v", err)}
+		}
+		*quit = true
 	}
+
 }
