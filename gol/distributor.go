@@ -2,10 +2,6 @@ package gol
 
 import (
 	"fmt"
-	"log"
-	"net/rpc"
-	"sync"
-	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
@@ -18,7 +14,7 @@ type distributorChannels struct {
 	ioOutput   chan<- uint8
 	ioInput    <-chan uint8
 
-	keyPresses <-chan rune // Newly added channel for key press
+	//keyPresses <-chan uint8 // Newly added channel for key press
 }
 
 // distributor divides the work between workers and interacts with other goroutines.
@@ -46,7 +42,6 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-
 	/*for turn = 0; turn < p.Turns; turn++ {
 		for y := 0; y < p.ImageHeight; y++ {
 			for x := 0; x < p.ImageWidth; x++ {
@@ -256,6 +251,7 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: alive}
+	makePGM(p, c, gameMap, turn)
 	// TODO: Report the final state using FinalTurnCompleteEvent.
 
 	makePGM(p, c, gameMap, turn)
@@ -324,15 +320,51 @@ func nextWorld(p Params, current [][]uint8) [][]uint8 {
 func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
 	newGameCell := make([][]uint8, endY-startY)
 	for y := startY; y < endY; y++ {
+	for y := startY; y < endY; y++ {
 		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
 		for x := 0; x < p.ImageWidth; x++ {
+		for x := 0; x < p.ImageWidth; x++ {
 			var currentCell util.Cell
+			currentCell.X = x
 			currentCell.X = x
 			currentCell.Y = y
 			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
 		}
+		}
 	}
 	calc <- newGameCell
+}
+
+func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
+	filename := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
+
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for y := 0; y < p.ImageHeight; y++ {
+		for x := 0; x < p.ImageWidth; x++ {
+			c.ioOutput <- gameMap[y][x]
+		}
+	}
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: filename}
+}
+
+func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int) {
+	switch key {
+	case 's':
+		makePGM(p, c, gameMap, turn)
+	case 'p':
+		*paused = !*paused
+		if *paused {
+			c.events <- StateChange{turn, Paused}
+		} else {
+			c.events <- StateChange{turn, Executing}
+		}
+	case 'q':
+		*quit = true
+	}
 }
 
 func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
