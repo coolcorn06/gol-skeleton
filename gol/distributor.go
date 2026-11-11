@@ -26,11 +26,14 @@ func distributor(p Params, c distributorChannels) {
 	}
 	c.ioCommand <- ioInput                                            // Set current mode as input
 	c.ioFilename <- fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight) // Read the image
-	var alive []util.Cell
+	var initialAlive []util.Cell
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
 			v := <-c.ioInput //waits for the next byte from IO and stores it in v
 			gameMap[y][x] = v
+			if v != 0 {
+				initialAlive = append(initialAlive, util.Cell{X: x, Y: y})
+			}
 		}
 	}
 	// Generate initial map
@@ -38,7 +41,7 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
+	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialAlive}
 	c.events <- StateChange{turn, Executing}
 	// Shared snapshot for the ticker: latest finished world and its turn number.
 	// Like the mutex-protected shared variables in the concurrency labs.
@@ -111,24 +114,34 @@ func distributor(p Params, c distributorChannels) {
 		for i := 0; i < p.Threads; i++ {
 			newworld = append(newworld, <-channels[i]...)
 		}
+
+		var flipped []util.Cell
+		for y := 0; y < p.ImageHeight; y++ {
+			for x := 0; x < p.ImageWidth; x++ {
+				if gameMap[y][x] != newworld[y][x] {
+					flipped = append(flipped, util.Cell{X: x, Y: y})
+				}
+			}
+		}
+
 		gameMap = newworld
-		turn++ //Respond to modification of condition of for loop
 
 		// Publish the finished world for the ticker and report the completed turn.
 		mu.Lock()
 		snapshot = gameMap
 		completedTurns = turn + 1
 		mu.Unlock()
-		c.events <- CellsFlipped{CompletedTurns: turn, Cells: alive}
+		c.events <- CellsFlipped{CompletedTurns: turn + 1, Cells: flipped}
 		c.events <- TurnComplete{CompletedTurns: turn + 1}
 
-		//gameMap, newGameMap = newGameMap, gameMap
+		turn++ //Respond to modification of condition of for loop
 	}
 	// Stop the ticker before closing events.
 	close(done)
 	<-tickerStopped
 	// TODO: Execute all turns of the Game of Life.
 
+	var alive []util.Cell
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
 			if gameMap[y][x] != 0 {
@@ -153,155 +166,35 @@ func distributor(p Params, c distributorChannels) {
 	close(c.events)
 }
 
-func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Decide stat of each cell in next turn
-	var hasLeft, hasRight, hasUp, hasDown bool
-	hasLeft, hasRight, hasUp, hasDown = true, true, true, true //Detect if that cell has neighbors on that direction
-	var count int                                              //Detect neighboring alive cells
-	if cell.X == 0 {
-		hasLeft = false
-	}
-	if cell.X == p.ImageWidth-1 {
-		hasRight = false
-	}
-	if cell.Y == 0 {
-		hasUp = false
-	}
-	if cell.Y == p.ImageHeight-1 {
-		hasDown = false
-	}
+func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 {
+	count := countNeighbours(currentMap, cell, p)
+	alive := currentMap[cell.Y][cell.X] != 0
 
-	if hasLeft && hasUp {
-		if currentMap[cell.Y-1][cell.X-1] != 0 {
-			count++
-		}
-	}
-	if hasUp {
-		if currentMap[cell.Y-1][cell.X] != 0 {
-			count++
-		}
-	}
-	if hasUp && hasRight {
-		if currentMap[cell.Y-1][cell.X+1] != 0 {
-			count++
-		}
-	}
-	if hasLeft {
-		if currentMap[cell.Y][cell.X-1] != 0 {
-			count++
-		}
-	}
-	if hasRight {
-		if currentMap[cell.Y][cell.X+1] != 0 {
-			count++
-		}
-	}
-	if hasLeft && hasDown {
-		if currentMap[cell.Y+1][cell.X-1] != 0 {
-			count++
-		}
-	}
-	if hasDown {
-		if currentMap[cell.Y+1][cell.X] != 0 {
-			count++
-		}
-	}
-	if hasRight && hasDown {
-		if currentMap[cell.Y+1][cell.X+1] != 0 {
-			count++
-		}
-	}
-	if !hasLeft {
-		if currentMap[cell.Y][p.ImageWidth-1] != 0 {
-			count++
-		}
-	}
-	if !hasUp {
-		if currentMap[p.ImageHeight-1][cell.X] != 0 {
-			count++
-		}
-	}
-	if !hasRight {
-		if currentMap[cell.Y][0] != 0 {
-			count++
-		}
-	}
-	if !hasDown {
-		if currentMap[0][cell.X] != 0 {
-			count++
-		}
-	}
-	if !hasLeft && !hasUp {
-		if currentMap[p.ImageHeight-1][p.ImageWidth-1] != 0 {
-			count++
-		}
-	}
-	if !hasLeft && !hasDown {
-		if currentMap[0][p.ImageWidth-1] != 0 {
-			count++
-		}
-	}
-	if !hasRight && !hasUp {
-		if currentMap[p.ImageHeight-1][0] != 0 {
-			count++
-		}
-	}
-	if !hasRight && !hasDown {
-		if currentMap[0][0] != 0 {
-			count++
-		}
-	}
-	if !hasLeft && hasUp {
-		if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
-			count++
-		}
-	}
-	if !hasLeft && hasDown {
-		if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
-			count++
-		}
-	}
-	if !hasRight && hasUp {
-		if currentMap[cell.Y-1][0] != 0 {
-			count++
-		}
-	}
-	if !hasRight && hasDown {
-		if currentMap[cell.Y+1][0] != 0 {
-			count++
-		}
-	}
-	if !hasUp && hasLeft {
-		if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
-			count++
-		}
-	}
-	if !hasUp && hasRight {
-		if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
-			count++
-		}
-	}
-	if !hasDown && hasLeft {
-		if currentMap[0][cell.X-1] != 0 {
-			count++
-		}
-	}
-	if !hasDown && hasRight {
-		if currentMap[0][cell.X+1] != 0 {
-			count++
-		}
-	}
-	//count the number of surrounding live cells
-
-	if currentMap[cell.Y][cell.X] != 0 {
-		if count == 2 || count == 3 {
-			return 255
-		}
-		return 0
-	}
-	if count == 3 {
+	// alive cell: 2 or 3 alive neighbors -> alive
+	// dead cell: 3 alive neighbors -> alive
+	// others -> dead
+	if count == 3 || (alive && count == 2) {
 		return 255
 	}
-	return 0 //final decision of current cell, with "else" omitted
+	return 0
+}
+
+func countNeighbours(currentMap [][]uint8, cell util.Cell, p Params) int {
+	count := 0
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			if dx == 0 && dy == 0 {
+				continue
+			}
+			// 环绕边界：加 p.ImageWidth/Height 是为了让 % 对负数也返回非负
+			ny := (cell.Y + dy + p.ImageHeight) % p.ImageHeight
+			nx := (cell.X + dx + p.ImageWidth) % p.ImageWidth
+			if currentMap[ny][nx] != 0 {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
