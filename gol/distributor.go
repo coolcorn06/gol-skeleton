@@ -37,6 +37,9 @@ func distributor(p Params, c distributorChannels) {
 			v := <-c.ioInput //waits for the next byte from IO and stores it in v
 			gameMap[y][x] = v
 			originalGameMap[y][x] = v
+			if v != 0 {
+				alive = append(alive, util.Cell{X: x, Y: y})
+			}
 		}
 	}
 	// Generate initial map
@@ -44,8 +47,8 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	c.events <- StateChange{turn, Executing}
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
+	c.events <- StateChange{turn, Executing}
 
 	/*for turn = 0; turn < p.Turns; turn++ {
 		for y := 0; y < p.ImageHeight; y++ {
@@ -133,7 +136,7 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}()
 
-		batchSize := 1
+		//batchSize := 1
 
 		type batchResult struct {
 			world [][]uint8
@@ -141,25 +144,25 @@ func distributor(p Params, c distributorChannels) {
 			err   error
 		}
 
-		for turn < p.Turns && !quitRequested {//main loop
-			if paused {
+		//toCompute := batchSize
+		//for turn < p.Turns && !quitRequested {//main loop
+			/*if paused {
 				key := <-c.keyPresses
 				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, client)
 				continue
-			}
+			}*/
 
 			// send 1 batch to engine, waiting for results async
-			toCompute := batchSize
-			if p.Turns-turn < toCompute {
-				toCompute = p.Turns - turn//how many turns left
-			}
-			req := EvolveRequest{World: gameMap, Turns: toCompute, Threads: p.Threads,
-				ImageWidth: p.ImageWidth, ImageHeight: p.ImageHeight}
+			
+			//if p.Turns-turn < toCompute {
+			//	toCompute = p.Turns - turn//how many turns left
+			//}
+			//req := EvolveRequest{World: gameMap, Turns: p.Turns, Threads: p.Threads,
+				//ImageWidth: p.ImageWidth, ImageHeight: p.ImageHeight}
 			resultCh := make(chan batchResult, 1)
 			go func() {
-				var resp EvolveResponse
-				err := client.Call("GolEngine.Evolve", req, &resp)
-				resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
+				world, turns, err := evolveRemotely(addr, p, gameMap)
+				resultCh <- batchResult{world, turns, err}
 			}()
 
 			// respond to keyPresses when waiting
@@ -174,6 +177,7 @@ func distributor(p Params, c distributorChannels) {
 				case res := <-resultCh:
 					if res.err != nil {
 						log.Printf("[Controller] Engine call failed: %v", res.err)
+						quitRequested = true // engine is gone: stop instead of retrying forever
 						break waiting
 					}
 					gameMap = res.world
@@ -199,9 +203,10 @@ func distributor(p Params, c distributorChannels) {
 					c.events <- CellsFlipped{CompletedTurns: turn, Cells: flipped}
 					c.events <- TurnComplete{CompletedTurns: turn}
 					break waiting
+				
 				}
 			}
-		}
+		//}
 	} else {
 		for turn < p.Turns && !quitRequested {
 			if paused {
@@ -242,6 +247,7 @@ func distributor(p Params, c distributorChannels) {
 	}
 
 	// Stop the ticker before closing events.
+	alive = nil
 	close(done)
 	<-tickerStopped
 
@@ -355,24 +361,38 @@ func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
 }
 
 func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int, client *rpc.Client) {
+	
 	switch key {
 	case 's':
-		makePGM(p, c, gameMap, turn)
+		if client != nil{
+			var resp EvolveResponse
+			err := client.Call("GolEngine.Screenshot", AliveRequest{}, &resp)
+			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
+		}
 	case 'p':
-		*paused = !*paused//flips
-		if *paused {
-			c.events <- StateChange{turn, Paused}
-		} else {
-			c.events <- StateChange{turn, Executing}
+		if client != nil{
+			var resp PauseResponse
+			err := client.Call("GolEngine.Pause", AliveRequest{}, &resp)
+			if err == nil{
+				if resp.Paused {
+					c.events <- StateChange{resp.Turn, Paused}
+				} else {
+					c.events <- StateChange{resp.Turn, Executing}
+				}}
 		}
 	case 'q':
-		*quit = true
+		if client != nil{
+			var resp EvolveResponse
+			err := client.Call("GolEngine.Screenshot", AliveRequest{}, &resp)
+			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
+			*quit = true
+		}
 	case 'k':
-		makePGM(p, c, gameMap, turn)
 		if client != nil{//client exists
-			var resp AliveResponse
+			var resp EvolveResponse
 			err := client.Call("GolEngine.CleanUp", AliveRequest{}, &resp)
-			if err != nil {log.Printf("[Controller] Engine call failed: %v", err)}
+			if err != nil {log.Printf("[Controller] Engine call failed: %v", err)
+		}else{makePGM(p, c, resp.World, resp.CompletedTurns)}
 		}
 		*quit = true
 	}
