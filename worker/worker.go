@@ -1,4 +1,4 @@
-package worker
+package main
 
 import (
 	"uk.ac.bris.cs/gameoflife/stub" 
@@ -59,7 +59,7 @@ func countNeighbours(currentMap [][]uint8, cell util.Cell, ImageHeight int, Imag
 	return count
 }
 
-func StartEngine(addr string) error {
+func StartWorker(addr string) error {
 	if err := rpc.Register(new(GolWorker)); err != nil {//makes the engine
 		return err
 	}

@@ -92,7 +92,7 @@ func distributor(p Params, c distributorChannels) {
 			case <-ticker.C://step 2: reporting arrive cells to the remote.
 				if tickerClient != nil {//if client exist
 					var resp AliveResponse
-					if err := tickerClient.Call("GolEngine.GetAliveCount", AliveRequest{}, &resp); err == nil {
+					if err := tickerClient.Call("GolBroker.GetAliveCount", AliveRequest{}, &resp); err == nil {
 						c.events <- AliveCellsCount{CompletedTurns: resp.Turn, CellsCount: resp.AliveCount}
 						continue
 					}
@@ -123,7 +123,7 @@ func distributor(p Params, c distributorChannels) {
 	if addr := EngineAddress(); addr != "" {//if addr finds a port.
 		client, err := rpc.Dial("tcp", addr)//connects to the engine.
 		if err != nil {//if fail to connect.
-			log.Printf("[Controller] engine at %v failed to dial: %v", addr, err)
+			log.Printf("[Controller] broker at %v failed to dial: %v", addr, err)
 			close(done)
 			<-tickerStopped
 			c.events <- StateChange{0, Quitting}
@@ -176,7 +176,7 @@ func distributor(p Params, c distributorChannels) {
 					} // no longer waiting for this batch
 				case res := <-resultCh:
 					if res.err != nil {
-						log.Printf("[Controller] Engine call failed: %v", res.err)
+						log.Printf("[Controller] Broker call failed: %v", res.err)
 						quitRequested = true // engine is gone: stop instead of retrying forever
 						break waiting
 					}
@@ -366,13 +366,13 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 	case 's':
 		if client != nil{
 			var resp EvolveResponse
-			err := client.Call("GolEngine.Screenshot", AliveRequest{}, &resp)
+			err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp)
 			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
 		}
 	case 'p':
 		if client != nil{
 			var resp PauseResponse
-			err := client.Call("GolEngine.Pause", AliveRequest{}, &resp)
+			err := client.Call("GolBroker.Pause", AliveRequest{}, &resp)
 			if err == nil{
 				if resp.Paused {
 					c.events <- StateChange{resp.Turn, Paused}
@@ -383,15 +383,15 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 	case 'q':
 		if client != nil{
 			var resp EvolveResponse
-			err := client.Call("GolEngine.Screenshot", AliveRequest{}, &resp)
+			err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp)
 			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
 			*quit = true
 		}
 	case 'k':
 		if client != nil{//client exists
 			var resp EvolveResponse
-			err := client.Call("GolEngine.CleanUp", AliveRequest{}, &resp)
-			if err != nil {log.Printf("[Controller] Engine call failed: %v", err)
+			err := client.Call("GolBroker.CleanUp", AliveRequest{}, &resp)
+			if err != nil {log.Printf("[Controller] Broker call failed: %v", err)
 		}else{makePGM(p, c, resp.World, resp.CompletedTurns)}
 		}
 		*quit = true

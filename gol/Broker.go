@@ -29,9 +29,9 @@ type EvolveResponse struct {
 }
 
 // GolEngine is the RPC service that evolves Game of Life on a remote machine.
-type GolEngine struct{}
+type GolBroker struct{}
 
-type EngineState struct {
+type BrokerState struct {
 	mu         sync.Mutex
 	cond *sync.Cond
 	aliveCount int
@@ -41,7 +41,7 @@ type EngineState struct {
 	workers []*rpc.Client
 }
 
-var engineState = &EngineState{}
+var brokerState = &BrokerState{}
 var workers []*rpc.Client
 
 type AliveRequest struct{}
@@ -55,21 +55,21 @@ type PauseResponse struct{
 	Turn int
 }
 
-func (e *GolEngine) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
-	engineState.mu.Lock()
-	resp.AliveCount = engineState.aliveCount
-	resp.Turn = engineState.turn
-	engineState.mu.Unlock()
+func (e *GolBroker) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
+	brokerState.mu.Lock()
+	resp.AliveCount = brokerState.aliveCount
+	resp.Turn = brokerState.turn
+	brokerState.mu.Unlock()
 	return nil
 }
 
-func (e *GolEngine) CleanUp(req AliveRequest, resp *EvolveResponse) error{
+func (e *GolBroker) CleanUp(req AliveRequest, resp *EvolveResponse) error{
 	go func (){
 		time.Sleep(2 *time.Microsecond)
 		os.Exit(0)
 	}()
-	resp.World = engineState.world
-	resp.CompletedTurns = engineState.turn
+	resp.World = brokerState.world
+	resp.CompletedTurns = brokerState.turn
 	return nil
 }
 
@@ -87,10 +87,11 @@ func connectToWorkers(ImageHeight int, ImageWidth int, currentmap [][]uint8)([][
 		channels[i] = make(chan [][]uint8)
 
 		go func(i int, req stub.ComputeRequest){
-			var resp stub.ComputeResponse
-			err := workers[i].Call(("GolWorker.Compute"), req, &resp)
-			if err != nil {log.Print(err)}
-			channels[i] <- resp.Calc
+
+				var resp stub.ComputeResponse
+				err := workers[i].Call(("GolWorker.Compute"), req, &resp)
+				if err != nil {log.Print(err)}
+				channels[i] <- resp.Calc
 		}(i, stub.ComputeRequest{StartY: startY, EndY: endY, ImageHeight: ImageHeight, ImageWidth: ImageWidth, CurrentMap: currentmap})
 
 	
@@ -104,7 +105,7 @@ func connectToWorkers(ImageHeight int, ImageWidth int, currentmap [][]uint8)([][
 }
 // Evolve processes every requested turn in a single blocking call (distributed step 1).
 //calculates all cells for all turns and returns final world and the num of turns.
-func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
+func (e *GolBroker) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 	p := Params{
 		Turns:       req.Turns,
 		Threads:     req.Threads,
@@ -117,11 +118,11 @@ func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 
 	world := req.World
 	for turn := 0; turn < p.Turns; turn++ {
-		engineState.mu.Lock()
-		for engineState.paused == true{
-			engineState.cond.Wait()
+		brokerState.mu.Lock()
+		for brokerState.paused == true{
+			brokerState.cond.Wait()
 		}
-		engineState.mu.Unlock()
+		brokerState.mu.Unlock()
 
 		newworld := connectToWorkers(p.ImageHeight,p.ImageWidth, world)
 		world = newworld
@@ -135,11 +136,11 @@ func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 				}
 			}
 		}
-		engineState.mu.Lock()
-		engineState.aliveCount = n
-		engineState.turn = turn + 1
-		engineState.world = world
-		engineState.mu.Unlock()
+		brokerState.mu.Lock()
+		brokerState.aliveCount = n
+		brokerState.turn = turn + 1
+		brokerState.world = world
+		brokerState.mu.Unlock()
 	}
 
 	resp.World = world
@@ -148,9 +149,10 @@ func (e *GolEngine) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 }
 
 // StartEngine registers the engine and serves RPC requests until the process exits.
-func StartEngine(addr string) error {
-	engineState.cond = sync.NewCond(&engineState.mu)
+func StartBroker(addr string) error {
+	brokerState.cond = sync.NewCond(&brokerState.mu)
 	workeraddress := strings.Split(os.Getenv("GOL_WORKERS"), ",")
+	if workeraddress == nil {return nil}
 
 	for _, waddr := range workeraddress{
 		client, err := rpc.Dial("tcp", waddr)
@@ -159,7 +161,7 @@ func StartEngine(addr string) error {
 		}
 		workers = append(workers, client)
 	}
-	if err := rpc.Register(new(GolEngine)); err != nil {//makes the engine
+	if err := rpc.Register(new(GolBroker)); err != nil {//makes the engine
 		return err
 	}
 	listener, err := net.Listen("tcp", addr)//opens network port. addr=port num
@@ -175,26 +177,26 @@ func StartEngine(addr string) error {
 // An environment variable is used because the tests call gol.Run directly and
 // never go through main, so a command line flag could not reach them.
 func EngineAddress() string {
-	return os.Getenv("GOL_ENGINE")
+	return os.Getenv("GOL_BROKER")
 }
 
-func (e *GolEngine) Screenshot(req AliveRequest, resp *EvolveResponse) error {
-	engineState.mu.Lock()
-	resp.World = engineState.world
-	resp.CompletedTurns = engineState.turn
-	engineState.mu.Unlock()
+func (e *GolBroker) Screenshot(req AliveRequest, resp *EvolveResponse) error {
+	brokerState.mu.Lock()
+	resp.World = brokerState.world
+	resp.CompletedTurns = brokerState.turn
+	brokerState.mu.Unlock()
 	return nil
 }
 
-func (e *GolEngine) Pause(req AliveRequest, resp *PauseResponse) error{
-	engineState.mu.Lock()
-	engineState.paused = !engineState.paused
-	if !engineState.paused {
-		engineState.cond.Broadcast()
+func (e *GolBroker) Pause(req AliveRequest, resp *PauseResponse) error{
+	brokerState.mu.Lock()
+	brokerState.paused = !brokerState.paused
+	if !brokerState.paused {
+		brokerState.cond.Broadcast()
 	}
-	resp.Turn = engineState.turn
-	resp.Paused = engineState.paused
-	engineState.mu.Unlock()
+	resp.Turn = brokerState.turn
+	resp.Paused = brokerState.paused
+	brokerState.mu.Unlock()
 
 	return nil
 }
@@ -214,7 +216,7 @@ func evolveRemotely(addr string, p Params, world [][]uint8) ([][]uint8, int, err
 		ImageHeight: p.ImageHeight,
 	}
 	var response EvolveResponse
-	if err := client.Call("GolEngine.Evolve", request, &response); err != nil {
+	if err := client.Call("GolBroker.Evolve", request, &response); err != nil {
 		return nil, 0, err
 	}
 	return response.World, response.CompletedTurns, nil
