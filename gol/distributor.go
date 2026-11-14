@@ -89,8 +89,8 @@ func distributor(p Params, c distributorChannels) {
 			select {
 			case <-done:
 				return
-			case <-ticker.C://step 2: reporting arrive cells to the remote.
-				if tickerClient != nil {//if client exist
+			case <-ticker.C: //step 2: reporting arrive cells to the remote.
+				if tickerClient != nil { //if client exist
 					var resp AliveResponse
 					if err := tickerClient.Call("GolBroker.GetAliveCount", AliveRequest{}, &resp); err == nil {
 						c.events <- AliveCellsCount{CompletedTurns: resp.Turn, CellsCount: resp.AliveCount}
@@ -120,9 +120,9 @@ func distributor(p Params, c distributorChannels) {
 	quitRequested = false
 	// Distributed step 1: if an engine address is configured, the whole evolution
 	// is delegated to a remote machine through one blocking RPC call.
-	if addr := EngineAddress(); addr != "" {//if addr finds a port.
-		client, err := rpc.Dial("tcp", addr)//connects to the engine.
-		if err != nil {//if fail to connect.
+	if addr := EngineAddress(); addr != "" { //if addr finds a port.
+		client, err := rpc.Dial("tcp", addr) //connects to the engine.
+		if err != nil {                      //if fail to connect.
 			log.Printf("[Controller] broker at %v failed to dial: %v", addr, err)
 			close(done)
 			<-tickerStopped
@@ -131,7 +131,7 @@ func distributor(p Params, c distributorChannels) {
 			return
 		}
 		defer func() {
-			if err := client.Close(); err != nil {//closes the connection.
+			if err := client.Close(); err != nil { //closes the connection.
 				log.Printf("[Controller] failed to close client: %v", err)
 			}
 		}()
@@ -143,22 +143,13 @@ func distributor(p Params, c distributorChannels) {
 			turns int
 			err   error
 		}
-
-		//toCompute := batchSize
-		//for turn < p.Turns && !quitRequested {//main loop
-			/*if paused {
+		for turn < p.Turns && !quitRequested {
+			if paused {
 				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, client)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, client)
 				continue
-			}*/
+			}
 
-			// send 1 batch to engine, waiting for results async
-			
-			//if p.Turns-turn < toCompute {
-			//	toCompute = p.Turns - turn//how many turns left
-			//}
-			//req := EvolveRequest{World: gameMap, Turns: p.Turns, Threads: p.Threads,
-				//ImageWidth: p.ImageWidth, ImageHeight: p.ImageHeight}
 			resultCh := make(chan batchResult, 1)
 			go func() {
 				world, turns, err := evolveRemotely(addr, p, gameMap)
@@ -170,8 +161,8 @@ func distributor(p Params, c distributorChannels) {
 			for {
 				select {
 				case key := <-c.keyPresses:
-					handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, client)
-					if quitRequested {
+					handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, client)
+					if quitRequested || paused {
 						break waiting
 					} // no longer waiting for this batch
 				case res := <-resultCh:
@@ -203,20 +194,20 @@ func distributor(p Params, c distributorChannels) {
 					c.events <- CellsFlipped{CompletedTurns: turn, Cells: flipped}
 					c.events <- TurnComplete{CompletedTurns: turn}
 					break waiting
-				
+
 				}
 			}
-		//}
+		}
 	} else {
 		for turn < p.Turns && !quitRequested {
 			if paused {
 				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, nil)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, nil)
 				continue
 			}
 			select {
 			case key := <-c.keyPresses:
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn, nil)
+				handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, nil)
 				continue
 			default:
 			}
@@ -266,7 +257,6 @@ func distributor(p Params, c distributorChannels) {
 	if !quitRequested {
 		makePGM(p, c, gameMap, turn)
 	}
-	
 
 	// Make sure that the Io has finished any output before exiting.
 	//c.ioCommand <- ioCheckIdle
@@ -360,39 +350,62 @@ func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
 	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: filename}
 }
 
-func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn int, client *rpc.Client) {
-	
+func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, gameMap [][]uint8, turn *int, client *rpc.Client) {
+
 	switch key {
 	case 's':
-		if client != nil{
+		if client != nil {
 			var resp EvolveResponse
 			err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp)
-			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
+			if err == nil {
+				makePGM(p, c, resp.World, resp.CompletedTurns)
+			}
+		} else {
+			makePGM(p, c, gameMap, *turn)
 		}
 	case 'p':
-		if client != nil{
+		*paused = !*paused // Don't forget to change local pause status
+		if client != nil {
 			var resp PauseResponse
 			err := client.Call("GolBroker.Pause", AliveRequest{}, &resp)
-			if err == nil{
+			if err == nil {
 				if resp.Paused {
 					c.events <- StateChange{resp.Turn, Paused}
 				} else {
 					c.events <- StateChange{resp.Turn, Executing}
-				}}
+				}
+			} else {
+				c.events <- StateChange{resp.Turn, Executing}
+			}
+		} else {
+			if *paused {
+				c.events <- StateChange{*turn, Paused}
+			} else {
+				c.events <- StateChange{*turn, Executing}
+			}
 		}
 	case 'q':
-		if client != nil{
+		if client != nil {
+			client.Call("GolBroker.StopEvolve", AliveRequest{}, &AliveRequest{})
 			var resp EvolveResponse
-			err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp)
-			if err == nil{makePGM(p, c, resp.World, resp.CompletedTurns)}
+			if err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp); err == nil {
+				makePGM(p, c, resp.World, resp.CompletedTurns)
+				*turn = resp.CompletedTurns // ← 见 P2
+			}
 			*quit = true
+		} else {
+			makePGM(p, c, gameMap, *turn)
 		}
+		*quit = true
 	case 'k':
-		if client != nil{//client exists
+		if client != nil { //client exists
 			var resp EvolveResponse
 			err := client.Call("GolBroker.CleanUp", AliveRequest{}, &resp)
-			if err != nil {log.Printf("[Controller] Broker call failed: %v", err)
-		}else{makePGM(p, c, resp.World, resp.CompletedTurns)}
+			if err != nil {
+				log.Printf("[Controller] Broker call failed: %v", err)
+			} else {
+				makePGM(p, c, resp.World, resp.CompletedTurns)
+			}
 		}
 		*quit = true
 	}

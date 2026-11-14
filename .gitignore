@@ -43,3 +43,6 @@ your-out\.txt
 your-time\.txt
 
 .DS_Store
+
+/out
+images/5120x5120.pgm
