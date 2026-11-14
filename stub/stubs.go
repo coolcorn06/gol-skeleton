@@ -1,3 +1,4 @@
+//sheared maeesage format between the broker and the worker.
 package stub
 
 type ComputeRequest struct{

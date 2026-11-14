@@ -1,3 +1,4 @@
+//starting point of worker program.
 package main
 import (
 	"flag"

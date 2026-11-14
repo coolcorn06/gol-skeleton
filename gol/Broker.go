@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"uk.ac.bris.cs/gameoflife/stub"
+	//"uk.ac.bris.cs/gameoflife/util"
 )
 
 // EvolveRequest is what the local controller sends to the remote engine:
@@ -67,6 +68,11 @@ type PauseResponse struct {
 	Turn   int
 }
 
+type WorkerResult struct{
+	rows [][]uint8
+	err error
+}
+
 func (e *GolBroker) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
 	brokerState.mu.Lock()
 	resp.AliveCount = brokerState.aliveCount
@@ -75,9 +81,9 @@ func (e *GolBroker) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
 	return nil
 }
 
-func (e *GolBroker) CleanUp(req AliveRequest, resp *EvolveResponse) error {
-	go func() {
-		time.Sleep(2 * time.Microsecond)
+func (e *GolBroker) CleanUp(req AliveRequest, resp *EvolveResponse) error{//stops engine
+	go func (){
+		time.Sleep(200 *time.Microsecond)
 		os.Exit(0)
 	}()
 	resp.World = brokerState.world
@@ -85,37 +91,52 @@ func (e *GolBroker) CleanUp(req AliveRequest, resp *EvolveResponse) error {
 	return nil
 }
 
-func connectToWorkers(ImageHeight int, ImageWidth int, currentmap [][]uint8) [][]uint8 {
+func countAlive(world [][]uint8) int{//counting alive cells
+	n := 0
+	for y := range world{
+		for x := range world[y]{
+			if world[y][x] != 0 {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func connectToWorkers(ImageHeight int, ImageWidth int, currentmap [][]uint8) ([][]uint8, error){
+	//splits the world into workers and send the data to each worker.
 	Threads := len(workers)
 	WorkerRow := ImageHeight / Threads
-	channels := make([]chan [][]uint8, Threads)
+	channels := make([]chan WorkerResult, Threads)
 	for i := 0; i < Threads; i++ {
 		startY := i * WorkerRow
 		endY := (i + 1) * WorkerRow
 		if i == Threads-1 {
 			endY = ImageHeight // the last worker also takes the remainder
 		}
-		channels[i] = make(chan [][]uint8)
+		channels[i] = make(chan WorkerResult, 1)//buffer is set to 1
 
 		go func(i int, req stub.ComputeRequest) {
 
 			var resp stub.ComputeResponse
 			err := workers[i].Call(("GolWorker.Compute"), req, &resp)
 			if err != nil {
-				log.Printf("[Broker] worker %d failed: %v", i, err)
-				channels[i] <- nil // mark as failed
-				return
+				log.Printf("[Broker] worker %d failed: %v", i, err)// mark as failed
 			}
-			channels[i] <- resp.Calc
+			channels[i] <- WorkerResult{rows: resp.Calc, err: err}
 		}(i, stub.ComputeRequest{StartY: startY, EndY: endY, ImageHeight: ImageHeight, ImageWidth: ImageWidth, CurrentMap: currentmap})
 
 	}
 
 	var next [][]uint8
 	for i := 0; i < Threads; i++ {
-		next = append(next, <-channels[i]...)
+		r := <-channels[i]
+		if r.err != nil{
+			return nil, r.err// if error, it returns not new world but an error.
+		}
+		next = append(next, r.rows...)//all results gathered.
 	}
-	return next
+	return next, nil
 }
 
 // Evolve processes every requested turn in a single blocking call (distributed step 1).
@@ -132,6 +153,13 @@ func (e *GolBroker) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 	}
 
 	world := req.World
+	brokerState.mu.Lock()
+	brokerState.world = req.World//brokerSate lives as long as the server process. so they have to be updated when this fucn get data
+	brokerState.turn = 0
+	brokerState.aliveCount = countAlive(world)
+	brokerState.paused = false
+	brokerState.mu.Unlock()
+
 	for turn := 0; turn < p.Turns; turn++ {
 		brokerState.mu.Lock()
 		for brokerState.paused && !brokerState.stopped {
@@ -143,18 +171,16 @@ func (e *GolBroker) Evolve(req EvolveRequest, resp *EvolveResponse) error {
 			break
 		}
 
-		newworld := connectToWorkers(p.ImageHeight, p.ImageWidth, world)
+		newworld, err := connectToWorkers(p.ImageHeight, p.ImageWidth, world)
+		if err != nil{
+			return err
+		}
 		world = newworld
 		//world = nextWorld(p, world)
+		world = newworld
 
-		n := 0
-		for y := range world {
-			for x := range world[y] {
-				if world[y][x] != 0 {
-					n++
-				}
-			}
-		}
+		n := countAlive(world)
+
 		brokerState.mu.Lock()
 		brokerState.aliveCount = n
 		brokerState.turn = turn + 1
@@ -184,7 +210,7 @@ func StartBroker(addr string) error {
 		if err != nil {
 			return err
 		}
-		workers = append(workers, client)
+		workers = append(workers, client)//holds all workers
 	}
 	if err := rpc.Register(new(GolBroker)); err != nil { //makes the engine
 		return err
@@ -205,7 +231,7 @@ func EngineAddress() string {
 	return os.Getenv("GOL_BROKER")
 }
 
-func (e *GolBroker) Screenshot(req AliveRequest, resp *EvolveResponse) error {
+func (e *GolBroker) Screenshot(req AliveRequest, resp *EvolveResponse) error {//take the current world
 	brokerState.mu.Lock()
 	resp.World = brokerState.world
 	resp.CompletedTurns = brokerState.turn
@@ -213,7 +239,7 @@ func (e *GolBroker) Screenshot(req AliveRequest, resp *EvolveResponse) error {
 	return nil
 }
 
-func (e *GolBroker) Pause(req AliveRequest, resp *PauseResponse) error {
+func (e *GolBroker) Pause(req AliveRequest, resp *PauseResponse) error{//basically the same thing as the pause which was in distributor.go
 	brokerState.mu.Lock()
 	brokerState.paused = !brokerState.paused
 	if !brokerState.paused {

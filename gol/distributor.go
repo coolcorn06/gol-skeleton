@@ -152,7 +152,7 @@ func distributor(p Params, c distributorChannels) {
 
 			resultCh := make(chan batchResult, 1)
 			go func() {
-				world, turns, err := evolveRemotely(addr, p, gameMap)
+				world, turns, err := evolveRemotely(addr, p, gameMap)//run the system
 				resultCh <- batchResult{world, turns, err}
 			}()
 
