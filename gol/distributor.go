@@ -2,8 +2,6 @@ package gol
 
 import (
 	"fmt"
-	"log"
-	"net/rpc"
 	"sync"
 	"time"
 
@@ -17,17 +15,20 @@ type distributorChannels struct {
 	ioFilename chan<- string
 	ioOutput   chan<- uint8
 	ioInput    <-chan uint8
-
 	keyPresses <-chan rune // Newly added channel for key press
 }
+
+var wg sync.WaitGroup
 
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels) {
 	gameMap := make([][]uint8, p.ImageHeight)
-	originalGameMap := make([][]uint8, p.ImageHeight) // Prepare to make paragraph for next phase
 	for i := range gameMap {
 		gameMap[i] = make([]uint8, p.ImageWidth)
-		originalGameMap[i] = make([]uint8, p.ImageWidth)
+	}
+	nextMap := make([][]uint8, p.ImageHeight)//second map
+	for i:= range nextMap{
+		nextMap[i] = make([]uint8, p.ImageWidth)
 	}
 	c.ioCommand <- ioInput                                            // Set current mode as input
 	c.ioFilename <- fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight) // Read the image
@@ -36,7 +37,6 @@ func distributor(p Params, c distributorChannels) {
 		for x := 0; x < p.ImageWidth; x++ {
 			v := <-c.ioInput //waits for the next byte from IO and stores it in v
 			gameMap[y][x] = v
-			originalGameMap[y][x] = v
 		}
 	}
 	// Generate initial map
@@ -44,24 +44,21 @@ func distributor(p Params, c distributorChannels) {
 	// TODO: Create a 2D slice to store the world.
 
 	turn := 0
-	c.events <- StateChange{turn, Executing}
-	c.events <- CellsFlipped{CompletedTurns: 0, Cells: alive}
-
-	/*for turn = 0; turn < p.Turns; turn++ {
-		for y := 0; y < p.ImageHeight; y++ {
-			for x := 0; x < p.ImageWidth; x++ {
-				var currentCell util.Cell
-				currentCell.Y = y
-				currentCell.X = x
-				newGameMap[y][x] = calculateLive(currentCell, p, gameMap)
+	var initialalives []util.Cell //initial alive cells detected.
+	for y := 0; y < p.ImageHeight; y++{
+		for x := 0; x < p.ImageWidth; x++{
+			if gameMap[y][x] != 0{
+				initialalives = append(initialalives, util.Cell{Y: y, X: x})
 			}
 		}
-		gameMap, newGameMap = newGameMap, gameMap
-	}*/
+	}
+
+	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialalives}//turn -> 0
+	c.events <- StateChange{0, Executing}
 	// Shared snapshot for the ticker: latest finished world and its turn number.
 	// Like the mutex-protected shared variables in the concurrency labs.
 	var mu sync.Mutex
-	snapshot := gameMap
+	snapshot := len(initialalives)
 	completedTurns := 0
 
 	// Ticker goroutine: every 2 seconds count alive cells in the snapshot
@@ -72,178 +69,121 @@ func distributor(p Params, c distributorChannels) {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		defer close(tickerStopped)
-
-		// Create a new Client for ticker under distributed mode
-		var tickerClient *rpc.Client
-		if addr := EngineAddress(); addr != "" {
-			if cl, err := rpc.Dial("tcp", addr); err == nil {
-				tickerClient = cl
-				defer tickerClient.Close()
-			}
-		}
-
 		for {
 			select {
 			case <-done:
-				return
+				return //trigers the defers
 			case <-ticker.C:
-				if tickerClient != nil {
-					var resp AliveResponse
-					if err := tickerClient.Call("GolEngine.GetAliveCount", AliveRequest{}, &resp); err == nil {
-						c.events <- AliveCellsCount{CompletedTurns: resp.Turn, CellsCount: resp.AliveCount}
-						continue
-					}
-				}
-				// fallback to local if RPC fails
 				mu.Lock()
-				world := snapshot
+				count := snapshot//if you count the alive cell here, it might take too long and the map may be overwritten. So just pass here an integer.
 				t := completedTurns
 				mu.Unlock()
-				count := 0
-				for y := range world {
+				//count := 0
+				/*for y := range world {//counting alive cells
 					for x := range world[y] {
 						if world[y][x] == 255 {
 							count++
 						}
 					}
-				}
+				}*/
 				c.events <- AliveCellsCount{CompletedTurns: t, CellsCount: count}
 			}
 		}
 	}()
 
+
+
+	
 	var paused, quitRequested bool
 	paused = false
 	quitRequested = false
-	// Distributed step 1: if an engine address is configured, the whole evolution
-	// is delegated to a remote machine through one blocking RPC call.
-	if addr := EngineAddress(); addr != "" {
-		client, err := rpc.Dial("tcp", addr)
-		if err != nil {
-			log.Printf("[Controller] engine at %v failed to dial: %v", addr, err)
-			close(done)
-			<-tickerStopped
-			c.events <- StateChange{0, Quitting}
-			close(c.events)
-			return
-		}
-		defer func() {
-			if err := client.Close(); err != nil {
-				log.Printf("[Controller] failed to close client: %v", err)
-			}
-		}()
+	
 
-		batchSize := 1
-
-		type batchResult struct {
-			world [][]uint8
-			turns int
-			err   error
+	//channels := make([]chan [][]uint8, p.Threads)
+	//WorkerRow := p.ImageHeight / p.Threads
+	for turn < p.Turns && !quitRequested { // Be aware, the condition is modified
+		// When pausing, "s" and "q" can still work normally
+		var changedcells []util.Cell
+		if paused {
+			//c.events <- StateChange{turn+1, Paused}
+			key := <-c.keyPresses
+			handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+			continue
 		}
 
-		for turn < p.Turns && !quitRequested {
-			if paused {
-				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
-				continue
+		// When not pausing, check if there is keyPresses required to process
+		select {
+		case key := <-c.keyPresses:
+			handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
+			continue
+		default:
+		}
+		base := p.ImageHeight/p.Threads
+		extra := p.ImageHeight%p.Threads//extra rows are equaly distributed to workers
+		startY := 0
+		rows := 0
+		
+		wg.Add(p.Threads)//needs to wait until the new map is wrote
+		for i := 0; i < p.Threads; i++ {
+			if i < extra {
+				rows = base + 1
+			}else{
+				rows = base
 			}
+			endY := startY + rows
 
-			// send 1 batch to engine, waiting for results async
-			toCompute := batchSize
-			if p.Turns-turn < toCompute {
-				toCompute = p.Turns - turn
-			}
-			req := EvolveRequest{World: gameMap, Turns: toCompute, Threads: p.Threads,
-				ImageWidth: p.ImageWidth, ImageHeight: p.ImageHeight}
-			resultCh := make(chan batchResult, 1)
-			go func() {
-				var resp EvolveResponse
-				err := client.Call("GolEngine.Evolve", req, &resp)
-				resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
-			}()
+			//channels[i] = make(chan [][]uint8)
+			go worker(p, startY, endY, gameMap, nextMap /*channels[i]*/)
 
-			// respond to keyPresses when waiting
-		waiting:
-			for {
-				select {
-				case key := <-c.keyPresses:
-					handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
-					if quitRequested {
-						break waiting
-					} // no longer waiting for this batch
-				case res := <-resultCh:
-					if res.err != nil {
-						log.Printf("[Controller} Engine call failed: %v", res.err)
-						break waiting
-					}
-					gameMap = res.world
-					turn += res.turns
-					var flipped []util.Cell
-					for y := 0; y < p.ImageHeight; y++ {
-						for x := 0; x < p.ImageWidth; x++ {
-							if gameMap[y][x] != originalGameMap[y][x] {
-								flipped = append(flipped, util.Cell{X: x, Y: y})
-							}
-						}
-					}
-					for y := 0; y < p.ImageHeight; y++ {
-						for x := 0; x < p.ImageWidth; x++ {
-							originalGameMap[y][x] = gameMap[y][x]
-						}
-					}
+			startY = endY
 
-					mu.Lock()
-					snapshot = gameMap
-					completedTurns = turn
-					mu.Unlock()
-					c.events <- CellsFlipped{CompletedTurns: turn, Cells: flipped}
-					c.events <- TurnComplete{CompletedTurns: turn}
-					break waiting
+		} // execute current turn
+		wg.Wait()
+		/*var newworld [][]uint8//New memory for each worker's strip is allocated inside the iteration loop, not once at start-up.
+		for i := 0; i < p.Threads; i++ {
+			newworld = append(newworld, <-channels[i]...)
+		}*/
+
+		for y := 0; y < p.ImageHeight; y++{//comparison between the old game map and new game map
+			for x := 0; x < p.ImageWidth; x++{
+				if gameMap[y][x] != nextMap[y][x]{
+					var changedcell util.Cell
+					changedcell.X = x
+					changedcell.Y = y
+					changedcells = append(changedcells, changedcell)
+					
 				}
 			}
 		}
-	} else {
-		for turn < p.Turns && !quitRequested {
-			if paused {
-				key := <-c.keyPresses
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
-				continue
-			}
-			select {
-			case key := <-c.keyPresses:
-				handleKey(key, &paused, &quitRequested, p, c, gameMap, turn)
-				continue
-			default:
-			}
-			gameMap = nextWorld(p, gameMap)
-			var flipped []util.Cell
-			for y := 0; y < p.ImageHeight; y++ {
-				for x := 0; x < p.ImageWidth; x++ {
-					if gameMap[y][x] != originalGameMap[y][x] {
-						flipped = append(flipped, util.Cell{X: x, Y: y})
-					}
+		c.events <- CellsFlipped{CompletedTurns:  turn+1, Cells: changedcells} //all changed cells are sent
+		gameMap, nextMap = nextMap, gameMap
+
+		count := 0
+		for y := range gameMap{
+			for x := range gameMap[y]{
+				if gameMap[y][x] == 255{
+					count ++
 				}
 			}
-			for y := 0; y < p.ImageHeight; y++ {
-				for x := 0; x < p.ImageWidth; x++ {
-					originalGameMap[y][x] = gameMap[y][x]
-				}
-			}
-			turn++
-
-			mu.Lock()
-			snapshot = gameMap
-			completedTurns = turn
-			mu.Unlock()
-
-			c.events <- CellsFlipped{CompletedTurns: turn, Cells: flipped}
-			c.events <- TurnComplete{CompletedTurns: turn}
 		}
+		 //Respond to modification of condition of for loop
+
+		// Publish the finished world for the ticker and report the completed turn.
+		mu.Lock()
+		snapshot = count
+		completedTurns = turn+1
+		mu.Unlock()
+
+		//c.events <- CellsFlipped{CompletedTurns: turn, Cells: alive}
+		c.events <- TurnComplete{CompletedTurns: turn+1}
+
+		turn++
+		//gameMap, newGameMap = newGameMap, gameMap
 	}
-
 	// Stop the ticker before closing events.
 	close(done)
 	<-tickerStopped
+	// TODO: Execute all turns of the Game of Life.
 
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
@@ -259,8 +199,6 @@ func distributor(p Params, c distributorChannels) {
 	makePGM(p, c, gameMap, turn)
 	// TODO: Report the final state using FinalTurnCompleteEvent.
 
-	makePGM(p, c, gameMap, turn)
-
 	// Make sure that the Io has finished any output before exiting.
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
@@ -270,70 +208,171 @@ func distributor(p Params, c distributorChannels) {
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	close(c.events)
 }
-func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 {
-	count := countNeighbours(currentMap, cell, p)
 
-	// Alive: 2 or 3 alive neighbors -> alive
-	// Dead: 3 alive neighbors -> alive
-	// others -> dead
-	if count == 3 || (currentMap[cell.Y][cell.X] != 0 && count == 2) {
+func calculateLive(cell util.Cell, p Params, currentMap [][]uint8) uint8 { //Decide stat of each cell in next turn
+	var hasLeft, hasRight, hasUp, hasDown bool
+	hasLeft, hasRight, hasUp, hasDown = true, true, true, true //Detect if that cell has neighbors on that direction
+	var count int                                              //Detect neighboring alive cells
+	if cell.X == 0 {
+		hasLeft = false
+	}
+	if cell.X == p.ImageWidth-1 {
+		hasRight = false
+	}
+	if cell.Y == 0 {
+		hasUp = false
+	}
+	if cell.Y == p.ImageHeight-1 {
+		hasDown = false
+	}
+
+	if hasLeft && hasUp {
+		if currentMap[cell.Y-1][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if hasUp {
+		if currentMap[cell.Y-1][cell.X] != 0 {
+			count++
+		}
+	}
+	if hasUp && hasRight {
+		if currentMap[cell.Y-1][cell.X+1] != 0 {
+			count++
+		}
+	}
+	if hasLeft {
+		if currentMap[cell.Y][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if hasRight {
+		if currentMap[cell.Y][cell.X+1] != 0 {
+			count++
+		}
+	}
+	if hasLeft && hasDown {
+		if currentMap[cell.Y+1][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if hasDown {
+		if currentMap[cell.Y+1][cell.X] != 0 {
+			count++
+		}
+	}
+	if hasRight && hasDown {
+		if currentMap[cell.Y+1][cell.X+1] != 0 {
+			count++
+		}
+	}
+	if !hasLeft {
+		if currentMap[cell.Y][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasUp {
+		if currentMap[p.ImageHeight-1][cell.X] != 0 {
+			count++
+		}
+	}
+	if !hasRight {
+		if currentMap[cell.Y][0] != 0 {
+			count++
+		}
+	}
+	if !hasDown {
+		if currentMap[0][cell.X] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && !hasUp {
+		if currentMap[p.ImageHeight-1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && !hasDown {
+		if currentMap[0][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasRight && !hasUp {
+		if currentMap[p.ImageHeight-1][0] != 0 {
+			count++
+		}
+	}
+	if !hasRight && !hasDown {
+		if currentMap[0][0] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && hasUp {
+		if currentMap[cell.Y-1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasLeft && hasDown {
+		if currentMap[cell.Y+1][p.ImageWidth-1] != 0 {
+			count++
+		}
+	}
+	if !hasRight && hasUp {
+		if currentMap[cell.Y-1][0] != 0 {
+			count++
+		}
+	}
+	if !hasRight && hasDown {
+		if currentMap[cell.Y+1][0] != 0 {
+			count++
+		}
+	}
+	if !hasUp && hasLeft {
+		if currentMap[p.ImageHeight-1][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if !hasUp && hasRight {
+		if currentMap[p.ImageHeight-1][cell.X+1] != 0 {
+			count++
+		}
+	}
+	if !hasDown && hasLeft {
+		if currentMap[0][cell.X-1] != 0 {
+			count++
+		}
+	}
+	if !hasDown && hasRight {
+		if currentMap[0][cell.X+1] != 0 {
+			count++
+		}
+	}
+	//count the number of surrounding live cells
+
+	if currentMap[cell.Y][cell.X] != 0 {
+		if count == 2 || count == 3 {
+			return 255
+		}
+		return 0
+	}
+	if count == 3 {
 		return 255
 	}
-	return 0
+	return 0 //final decision of current cell, with "else" omitted
 }
 
-func countNeighbours(currentMap [][]uint8, cell util.Cell, p Params) int {
-	count := 0
-	for dy := -1; dy <= 1; dy++ {
-		for dx := -1; dx <= 1; dx++ {
-			if dx == 0 && dy == 0 {
-				continue
-			}
-			// in golang, mod to negative int returns negative result
-			ny := (cell.Y + dy + p.ImageHeight) % p.ImageHeight
-			nx := (cell.X + dx + p.ImageWidth) % p.ImageWidth
-			if currentMap[ny][nx] != 0 {
-				count++
-			}
-		}
-	}
-	return count
-}
-
-// nextWorld evolves one turn, splitting the board into p.Threads horizontal bands
-// (the same divide-and-conquer pattern used in the concurrency lab's image filter).
-func nextWorld(p Params, current [][]uint8) [][]uint8 {
-	WorkerRow := p.ImageHeight / p.Threads
-	channels := make([]chan [][]uint8, p.Threads)
-	for i := 0; i < p.Threads; i++ {
-		startY := i * WorkerRow
-		endY := (i + 1) * WorkerRow
-		if i == p.Threads-1 {
-			endY = p.ImageHeight // the last worker also takes the remainder
-		}
-		channels[i] = make(chan [][]uint8)
-		go worker(p, startY, endY, current, channels[i])
-	}
-
-	var next [][]uint8
-	for i := 0; i < p.Threads; i++ {
-		next = append(next, <-channels[i]...)
-	}
-	return next
-}
-
-func worker(p Params, startY, endY int, currentMap [][]uint8, calc chan<- [][]uint8) {
-	newGameCell := make([][]uint8, endY-startY)
+func worker(p Params, startY, endY int, currentMap [][]uint8, nextMap [][]uint8/*, calc chan<- [][]uint8*/) {
+	//newGameCell := make([][]uint8, endY-startY)
+	defer wg.Done()
 	for y := startY; y < endY; y++ {
-		newGameCell[y-startY] = make([]uint8, p.ImageWidth)
+		//newGameCell[y-startY] = make([]uint8, p.ImageWidth)
 		for x := 0; x < p.ImageWidth; x++ {
 			var currentCell util.Cell
 			currentCell.X = x
 			currentCell.Y = y
-			newGameCell[y-startY][x] = calculateLive(currentCell, p, currentMap)
+			nextMap[y][x] = calculateLive(currentCell, p, currentMap)
 		}
 	}
-	calc <- newGameCell
+	//calc <- newGameCell
 }
 
 func makePGM(p Params, c distributorChannels, gameMap [][]uint8, turn int) {
