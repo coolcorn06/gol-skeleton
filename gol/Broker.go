@@ -46,7 +46,7 @@ type BrokerState struct {
 }
 
 // StopEvolve breaks the Evolve
-func (e *GolBroker) StopEvolve(req AliveRequest, resp AliveRequest) error {
+func (e *GolBroker) StopEvolve(req AliveRequest, resp *AliveRequest) error {
 	brokerState.mu.Lock()
 	brokerState.stopped = true
 	brokerState.mu.Unlock()
@@ -83,11 +83,13 @@ func (e *GolBroker) GetAliveCount(req AliveRequest, resp *AliveResponse) error {
 
 func (e *GolBroker) CleanUp(req AliveRequest, resp *EvolveResponse) error{//stops engine
 	go func (){
-		time.Sleep(200 *time.Microsecond)
+		time.Sleep(200 *time.Millisecond)
 		os.Exit(0)
 	}()
+	brokerState.mu.Lock()
 	resp.World = brokerState.world
 	resp.CompletedTurns = brokerState.turn
+	brokerState.mu.Unlock()
 	return nil
 }
 

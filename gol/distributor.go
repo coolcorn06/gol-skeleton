@@ -390,7 +390,7 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 			var resp EvolveResponse
 			if err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp); err == nil {
 				makePGM(p, c, resp.World, resp.CompletedTurns)
-				*turn = resp.CompletedTurns // ← 见 P2
+				*turn = resp.CompletedTurns 
 			}
 			*quit = true
 		} else {
