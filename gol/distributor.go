@@ -157,15 +157,12 @@ func distributor(p Params, c distributorChannels) {
 			resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
 		}()
 		for turn < p.Turns && !quitRequested {
-
-			// 暂停：阻塞等按键，s/q/p 都能响应
 			if paused {
 				key := <-c.keyPresses
 				handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, client)
 				continue
 			}
 
-			// 发一个 batch
 			toCompute := batchSize
 			if p.Turns-turn < toCompute {
 				toCompute = p.Turns - turn
@@ -184,7 +181,6 @@ func distributor(p Params, c distributorChannels) {
 				resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
 			}()
 
-			// 等这个 batch，同时响应按键
 		waiting:
 			for {
 				select {
@@ -200,7 +196,7 @@ func distributor(p Params, c distributorChannels) {
 						break waiting
 					}
 					gameMap = res.world
-					turn += res.turns // ← 注意是 +=，不是 =
+					turn += res.turns
 					var flipped []util.Cell
 					for y := 0; y < p.ImageHeight; y++ {
 						for x := 0; x < p.ImageWidth; x++ {
@@ -420,7 +416,7 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 			var resp EvolveResponse
 			if err := client.Call("GolBroker.Screenshot", AliveRequest{}, &resp); err == nil {
 				makePGM(p, c, resp.World, resp.CompletedTurns)
-				*turn = resp.CompletedTurns 
+				*turn = resp.CompletedTurns
 			}
 			*quit = true
 		} else {
