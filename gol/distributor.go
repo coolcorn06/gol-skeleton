@@ -136,27 +136,55 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}()
 
-		//batchSize := 1
+		const batchSize = 10
 
 		type batchResult struct {
 			world [][]uint8
 			turns int
 			err   error
 		}
+		resultCh := make(chan batchResult, 1)
+		go func() {
+			var req = EvolveRequest{
+				World:       gameMap,
+				Turns:       p.Turns,
+				Threads:     p.Threads,
+				ImageWidth:  p.ImageWidth,
+				ImageHeight: p.ImageHeight,
+			}
+			var resp EvolveResponse
+			err := client.Call("GolBroker.Evolve", req, &resp) // reuse client，do not create new connection
+			resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
+		}()
 		for turn < p.Turns && !quitRequested {
+
+			// 暂停：阻塞等按键，s/q/p 都能响应
 			if paused {
 				key := <-c.keyPresses
 				handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, client)
 				continue
 			}
 
+			// 发一个 batch
+			toCompute := batchSize
+			if p.Turns-turn < toCompute {
+				toCompute = p.Turns - turn
+			}
+			req := EvolveRequest{
+				World:       gameMap,
+				Turns:       toCompute,
+				Threads:     p.Threads,
+				ImageWidth:  p.ImageWidth,
+				ImageHeight: p.ImageHeight,
+			}
 			resultCh := make(chan batchResult, 1)
 			go func() {
-				world, turns, err := evolveRemotely(addr, p, gameMap)//run the system
-				resultCh <- batchResult{world, turns, err}
+				var resp EvolveResponse
+				err := client.Call("GolBroker.Evolve", req, &resp)
+				resultCh <- batchResult{resp.World, resp.CompletedTurns, err}
 			}()
 
-			// respond to keyPresses when waiting
+			// 等这个 batch，同时响应按键
 		waiting:
 			for {
 				select {
@@ -164,15 +192,15 @@ func distributor(p Params, c distributorChannels) {
 					handleKey(key, &paused, &quitRequested, p, c, gameMap, &turn, client)
 					if quitRequested || paused {
 						break waiting
-					} // no longer waiting for this batch
+					}
 				case res := <-resultCh:
 					if res.err != nil {
 						log.Printf("[Controller] Broker call failed: %v", res.err)
-						quitRequested = true // engine is gone: stop instead of retrying forever
+						quitRequested = true
 						break waiting
 					}
 					gameMap = res.world
-					turn += res.turns
+					turn += res.turns // ← 注意是 +=，不是 =
 					var flipped []util.Cell
 					for y := 0; y < p.ImageHeight; y++ {
 						for x := 0; x < p.ImageWidth; x++ {
@@ -186,7 +214,6 @@ func distributor(p Params, c distributorChannels) {
 							originalGameMap[y][x] = gameMap[y][x]
 						}
 					}
-
 					mu.Lock()
 					snapshot = gameMap
 					completedTurns = turn
@@ -194,7 +221,6 @@ func distributor(p Params, c distributorChannels) {
 					c.events <- CellsFlipped{CompletedTurns: turn, Cells: flipped}
 					c.events <- TurnComplete{CompletedTurns: turn}
 					break waiting
-
 				}
 			}
 		}
@@ -375,7 +401,11 @@ func handleKey(key rune, paused, quit *bool, p Params, c distributorChannels, ga
 					c.events <- StateChange{resp.Turn, Executing}
 				}
 			} else {
-				c.events <- StateChange{resp.Turn, Executing}
+				if *paused {
+					c.events <- StateChange{*turn, Paused}
+				} else {
+					c.events <- StateChange{*turn, Executing}
+				}
 			}
 		} else {
 			if *paused {
